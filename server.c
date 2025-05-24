@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define TABLE_MAX_PAGES 100
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
 
 typedef enum
 {
@@ -18,11 +19,14 @@ typedef enum
     STATEMENT_INSERT,
 } StatementType;
 
+const uint32_t USERNAME_LENGTH = 32;
+const uint32_t EMAIL_LENGTH = 255;
+
 typedef struct
 {
     int id;
-    char username[30];
-    char email[100];
+    char username[USERNAME_LENGTH + 1];
+    char email[EMAIL_LENGTH + 1];
 } Record;
 
 typedef struct
@@ -42,6 +46,8 @@ typedef enum
 {
     EXTRACT_STATEMENT_SUCCESS,
     EXTRACT_STATEMENT_SYNTAX_ERROR,
+    EXTRACT_STATEMENT_STRING_TOO_LONG,
+    EXTRACT_STATEMENT_IS_IS_NEGATIVE,
     EXTRACT_STATEMENT_UNRECOGNISED,
 } ExtractStatementStatus;
 
@@ -52,15 +58,19 @@ typedef enum
 } ExecuteStatementResult;
 
 const uint32_t PAGE_SIZE = 4096; // 4kb per page
-const uint32_t RECORD_SIZE = sizeof(Record);
-const uint32_t RECORD_PER_PAGE = PAGE_SIZE / RECORD_SIZE;
-const uint32_t TABLE_MAX_RECORDS = TABLE_MAX_PAGES * RECORD_PER_PAGE;
+
 const uint32_t RECORD_ID_SIZE = sizeof(int);
 const uint32_t RECORD_ID_OFFSET = 0;
-const uint32_t RECORD_USERNAME_SIZE = sizeof(char[30]);
+
+const uint32_t RECORD_USERNAME_SIZE = size_of_attribute(Record, username);
 const uint32_t RECORD_USERNAME_OFFSET = RECORD_ID_SIZE;
-const uint32_t RECORD_EMAIL_SIZE = sizeof(char[100]);
+
+const uint32_t RECORD_EMAIL_SIZE = size_of_attribute(Record, email);
 const uint32_t RECORD_EMAIL_OFFSET = RECORD_ID_SIZE + RECORD_USERNAME_SIZE;
+
+const uint32_t RECORD_SIZE = RECORD_ID_SIZE + RECORD_USERNAME_SIZE + RECORD_EMAIL_SIZE;
+const uint32_t RECORD_PER_PAGE = PAGE_SIZE / RECORD_SIZE;
+const uint32_t TABLE_MAX_RECORDS = TABLE_MAX_PAGES * RECORD_PER_PAGE;
 
 Table *get_table()
 {
@@ -144,12 +154,28 @@ ExtractStatementStatus extract_statement_from_command(char *command, Statement *
     if (strncmp(command, "insert", 6) == 0)
     {
         statement->type = STATEMENT_INSERT;
-        int num_args = sscanf(command, "insert %i %s %s", &(statement->record.id), statement->record.username, statement->record.email);
+        char *keyword = strtok(command, " ");
+        char *recordId = strtok(NULL, " ");
+        char *recordUsername = strtok(NULL, " ");
+        char *recordEmail = strtok(NULL, " ");
 
-        if (num_args != 3)
+        if (recordId == NULL || recordUsername == NULL || recordEmail == NULL)
         {
-            return EXTRACT_STATEMENT_SYNTAX_ERROR;
+            return EXTRACT_STATEMENT_UNRECOGNISED;
         }
+        if (atoi(recordId) < 1)
+        {
+            return EXTRACT_STATEMENT_IS_IS_NEGATIVE;
+        }
+
+        if (strlen(recordUsername) > USERNAME_LENGTH || strlen(recordEmail) > EMAIL_LENGTH)
+        {
+            return EXTRACT_STATEMENT_STRING_TOO_LONG;
+        }
+
+        statement->record.id = atoi(recordId);
+        strcpy(statement->record.username, recordUsername);
+        strcpy(statement->record.email, recordEmail);
         return EXTRACT_STATEMENT_SUCCESS;
     }
     else if (strncmp(command, "select", 6) == 0)
@@ -178,7 +204,7 @@ ExecuteStatementResult execute_insert(Table *table, Statement *statement)
 {
     if (table->numberOfRecords >= TABLE_MAX_RECORDS)
     {
-        printf("Maximum number of rows's exceeded!");
+        printf("Error: Maximum number of rows's exceeded!\n");
         return EXECUTE_STATEMENT_FULL_ROWS;
     }
 
@@ -236,8 +262,6 @@ ExecuteStatementResult execute_statement(Table *table, Statement *statement)
 
 int main(int argc, char const *argv[])
 {
-    printf("Server's listening!\n");
-
     Table *table = get_table();
     while (true)
     {
@@ -275,12 +299,20 @@ int main(int argc, char const *argv[])
             printf("Unrecognized keyword at start of '%s'.\n", userInput);
             clear_input_buffer(userInput);
             continue;
+        case EXTRACT_STATEMENT_IS_IS_NEGATIVE:
+            printf("ID must be positive.\n");
+            clear_input_buffer(userInput);
+            continue;
+        case EXTRACT_STATEMENT_STRING_TOO_LONG:
+            printf("String is too long.\n");
+            clear_input_buffer(userInput);
+            continue;
         }
         // some processes are done
         switch (execute_statement(table, &statement))
         {
         case EXECUTE_STATEMENT_SUCCESS:
-            printf("Executed!\n");
+            printf("Executed.\n");
             break;
         case EXECUTE_STATEMENT_FULL_ROWS:
             // free memory address after using it
