@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define TABLE_MAX_PAGES 100
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
@@ -37,9 +39,17 @@ typedef struct
 
 typedef struct
 {
-    int numberOfRecords;
+    int file_descriptor;
     // page's supposed to be big (maximum 4kb) so using pointer help reduce memory usage by allocating incrementally
+    // using multiple pages instead so that we can allocate page incrementally in chunk, not the whole database in once?
     void *pages[TABLE_MAX_PAGES];
+    u_int32_t file_length;
+} Pager;
+
+typedef struct
+{
+    int numberOfRecords;
+    Pager *pager;
 } Table;
 
 typedef enum
@@ -47,7 +57,7 @@ typedef enum
     EXTRACT_STATEMENT_SUCCESS,
     EXTRACT_STATEMENT_SYNTAX_ERROR,
     EXTRACT_STATEMENT_STRING_TOO_LONG,
-    EXTRACT_STATEMENT_IS_IS_NEGATIVE,
+    EXTRACT_STATEMENT_ID_IS_NEGATIVE,
     EXTRACT_STATEMENT_UNRECOGNISED,
 } ExtractStatementStatus;
 
@@ -72,9 +82,37 @@ const uint32_t RECORD_SIZE = RECORD_ID_SIZE + RECORD_USERNAME_SIZE + RECORD_EMAI
 const uint32_t RECORD_PER_PAGE = PAGE_SIZE / RECORD_SIZE;
 const uint32_t TABLE_MAX_RECORDS = TABLE_MAX_PAGES * RECORD_PER_PAGE;
 
-Table *get_table()
+Pager *open_pager(const char *database_file)
+{
+
+    int database_fd = open(database_file, O_RDWR | O_CREAT, 0644);
+
+    if (database_fd == -1)
+    {
+        perror("Failure on opening database file");
+        exit(EXIT_FAILURE);
+    }
+    Pager *pager = (Pager *)calloc(1, sizeof(Pager));
+    off_t file_length = lseek(database_fd, 0, SEEK_END);
+
+    if (file_length == -1)
+    {
+        perror("Failure on getting database file length");
+        exit(EXIT_FAILURE);
+    }
+    pager->file_descriptor = database_fd;
+    pager->file_length = file_length;
+
+    return pager;
+}
+
+Table *open_database(const char *database_file)
 {
     Table *table = (Table *)calloc(1, sizeof(Table));
+    Pager *pager = open_pager(database_file);
+
+    table->pager = pager;
+    table->numberOfRecords = pager->file_length / RECORD_SIZE;
 
     return table;
 }
@@ -86,7 +124,7 @@ char *get_input()
 
     if (!inputBuffer)
     {
-        perror("Malloc failed!");
+        perror("Malloc failed");
         exit(EXIT_FAILURE);
     }
     // c for capture user input each type user type.
@@ -105,7 +143,7 @@ char *get_input()
 
             if (!newBuffer)
             {
-                perror("Realloc failed!");
+                perror("Realloc failed");
                 free(inputBuffer);
                 exit(EXIT_FAILURE);
             }
@@ -127,11 +165,26 @@ void clear_input_buffer(char *buffer)
 
 void clear_table(Table *table)
 {
-    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    // write to database file
+    for (uint32_t i = 0; i <= table->numberOfRecords / RECORD_PER_PAGE; i++)
     {
-        free(table->pages[i]);
-        table->pages[i] = NULL;
+        uint32_t current_page_size;
+        if (i == table->numberOfRecords / RECORD_PER_PAGE)
+        {
+            current_page_size = RECORD_SIZE * (table->numberOfRecords % RECORD_PER_PAGE);
+        }
+        else
+        {
+            current_page_size = PAGE_SIZE;
+        }
+        lseek(table->pager->file_descriptor, i * PAGE_SIZE, SEEK_SET);
+        write(table->pager->file_descriptor, table->pager->pages[i], current_page_size);
+        free(table->pager->pages[i]);
+        table->pager->pages[i] = NULL;
     }
+    close(table->pager->file_descriptor);
+    free(table->pager);
+    table->pager = NULL;
     free(table);
     table = NULL;
 }
@@ -165,7 +218,7 @@ ExtractStatementStatus extract_statement_from_command(char *command, Statement *
         }
         if (atoi(recordId) < 1)
         {
-            return EXTRACT_STATEMENT_IS_IS_NEGATIVE;
+            return EXTRACT_STATEMENT_ID_IS_NEGATIVE;
         }
 
         if (strlen(recordUsername) > USERNAME_LENGTH || strlen(recordEmail) > EMAIL_LENGTH)
@@ -200,6 +253,39 @@ void deserialize_record(Record *record, void *position)
     memcpy(record->email, (uint8_t *)position + RECORD_EMAIL_OFFSET, RECORD_EMAIL_SIZE);
 }
 
+void *get_page(Pager *pager, int num_page)
+{
+    if (pager->pages[num_page] == NULL)
+    {
+        pager->pages[num_page] = calloc(1, PAGE_SIZE);
+    }
+    off_t offset = lseek(pager->file_descriptor, num_page * PAGE_SIZE, SEEK_SET);
+
+    if (offset == -1)
+    {
+        perror("Failed on moving the pointer");
+        exit(EXIT_FAILURE);
+    }
+    ssize_t bytes_read = read(pager->file_descriptor, pager->pages[num_page], PAGE_SIZE);
+
+    if (bytes_read == -1)
+    {
+        perror("Failed on reading content from database");
+        exit(EXIT_FAILURE);
+    }
+
+    return pager->pages[num_page];
+}
+
+void *get_record_position(Pager *pager, int record_num)
+{
+    uint32_t currentPage = record_num / RECORD_PER_PAGE;
+    void *page = get_page(pager, currentPage);
+    uint32_t offset = record_num % RECORD_PER_PAGE;
+
+    return (uint8_t *)page + offset * RECORD_SIZE;
+}
+
 ExecuteStatementResult execute_insert(Table *table, Statement *statement)
 {
     if (table->numberOfRecords >= TABLE_MAX_RECORDS)
@@ -210,13 +296,8 @@ ExecuteStatementResult execute_insert(Table *table, Statement *statement)
 
     // copy record from statement to database
     // remove padding as well
-    uint32_t currentPage = table->numberOfRecords / RECORD_PER_PAGE;
-    uint32_t offset = table->numberOfRecords % RECORD_PER_PAGE;
-    if (table->pages[currentPage] == NULL)
-    {
-        table->pages[currentPage] = calloc(1, PAGE_SIZE);
-    }
-    serialize_record(&(statement->record), (Record *)(table->pages[currentPage]) + offset);
+    void *new_record_position = get_record_position(table->pager, table->numberOfRecords);
+    serialize_record(&(statement->record), new_record_position);
 
     table->numberOfRecords++;
     return EXECUTE_STATEMENT_SUCCESS;
@@ -224,26 +305,13 @@ ExecuteStatementResult execute_insert(Table *table, Statement *statement)
 
 ExecuteStatementResult execute_select(Table *table, Statement *statement)
 {
-    for (uint32_t page = 0; page <= table->numberOfRecords / RECORD_PER_PAGE; page++)
+    for (int record_num = 0; record_num < table->numberOfRecords; record_num++)
     {
-        uint32_t maxRecords;
-        bool isLastPage = page == table->numberOfRecords / RECORD_PER_PAGE;
+        void *record_position = get_record_position(table->pager, record_num);
+        Record record;
 
-        if (isLastPage)
-        {
-            maxRecords = table->numberOfRecords % RECORD_PER_PAGE;
-        }
-        else
-        {
-            maxRecords = RECORD_PER_PAGE;
-        }
-        for (Record *position = table->pages[page]; position < (Record *)(table->pages[page]) + maxRecords; position++)
-        {
-            Record record;
-
-            deserialize_record(&record, position);
-            printf("(%i, %s, %s)\n", record.id, record.username, record.email);
-        }
+        deserialize_record(&record, record_position);
+        printf("(%i, %s, %s)\n", record.id, record.username, record.email);
     }
     return EXECUTE_STATEMENT_SUCCESS;
 }
@@ -262,12 +330,14 @@ ExecuteStatementResult execute_statement(Table *table, Statement *statement)
 
 int main(int argc, char const *argv[])
 {
-    Table *table = get_table();
+    const char *database_file = argv[1];
+    Table *table = open_database(database_file);
     while (true)
     {
         // read data from input and load to input buffer
         printf("db > ");
 
+        // Layer 1: Interface
         char *userInput = get_input();
 
         // processing input data
@@ -285,7 +355,7 @@ int main(int argc, char const *argv[])
                 continue;
             }
         }
-        // extract statement tokens
+        // Layer 2: Command processor
         Statement statement;
         switch (extract_statement_from_command(userInput, &statement))
         {
@@ -299,7 +369,7 @@ int main(int argc, char const *argv[])
             printf("Unrecognized keyword at start of '%s'.\n", userInput);
             clear_input_buffer(userInput);
             continue;
-        case EXTRACT_STATEMENT_IS_IS_NEGATIVE:
+        case EXTRACT_STATEMENT_ID_IS_NEGATIVE:
             printf("ID must be positive.\n");
             clear_input_buffer(userInput);
             continue;
@@ -308,7 +378,7 @@ int main(int argc, char const *argv[])
             clear_input_buffer(userInput);
             continue;
         }
-        // some processes are done
+        // Layer 3: Virtual Machine
         switch (execute_statement(table, &statement))
         {
         case EXECUTE_STATEMENT_SUCCESS:
