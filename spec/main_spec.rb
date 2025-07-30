@@ -33,12 +33,21 @@ describe 'database' do
   end
 
   it 'prints error message when table is full' do
-    script = (1..1401).map do |i|
+    script = (1..1301).map do |i|
       "insert #{i} user#{i} person#{i}@example.com"
     end
     script << ".exit"
     result = run_script(script)
     expect(result[-2]).to eq("db > Error: Maximum number of rows's exceeded!")
+  end
+
+  it 'prints error message when table is full' do
+    script = (1..1300).map do |i|
+      "insert #{i} user#{i} person#{i}@example.com"
+    end
+    script << ".exit"
+    result = run_script(script)
+    expect(result[-2]).to eq("db > Executed.")
   end
 
   it 'prints error message when id is negative' do
